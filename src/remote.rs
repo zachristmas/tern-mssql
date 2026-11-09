@@ -142,7 +142,42 @@ fn tern(args: &[&str]) -> Option<String> {
 	out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Opens `req` in an editor pane for `profile`: an existing one if it is listening, else a new pane to the right of this one.
+/// The pane of an editor that is listening right now and sits in the same tab as `here`, whichever connection it serves.
+fn editor_pane_beside(here: &str) -> Option<String> {
+	let ls = tern(&["ls", "--json"])?;
+	let v: serde_json::Value = serde_json::from_str(&ls).ok()?;
+	let tab_of = |pane: &str| -> Option<usize> {
+		let id: u64 = pane.parse().ok()?;
+		let mut n = 0;
+		for s in v.get("sessions")?.as_array()? {
+			for t in s.get("tabs")?.as_array()? {
+				n += 1;
+				if t.get("blocks")?.as_array()?.iter().any(|b| b.get("id").and_then(serde_json::Value::as_u64) == Some(id)) {
+					return Some(n);
+				}
+			}
+		}
+		None
+	};
+	let tab = tab_of(here)?;
+	let files: Vec<PathBuf> = std::fs::read_dir(dir()).ok()?.flatten().map(|e| e.path()).collect();
+	for path in files {
+		let Some(entry) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Entry>(&t).ok()) else { continue };
+		let Some(pane) = entry.pane else { continue };
+		if tab_of(&pane) != Some(tab) {
+			continue;
+		}
+		let addr = std::net::SocketAddr::from(([127, 0, 0, 1], entry.port));
+		if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+			return Some(pane);
+		}
+		let _ = std::fs::remove_file(&path);
+	}
+	None
+}
+
+/// Opens `req` in an editor pane for `profile`: an existing one if it is listening, else a new pane. The first editor
+/// goes to the right of the explorer; later ones stack under an editor already open in this tab, so the explorer keeps its column.
 pub fn open(profile: &str, req: &Request, focus: bool) -> Result<(), String> {
 	if let Some(pane) = send(profile, req) {
 		if let Some(p) = pane.filter(|_| focus) {
@@ -152,7 +187,11 @@ pub fn open(profile: &str, req: &Request, focus: bool) -> Result<(), String> {
 	}
 	let here = std::env::var("TERN_PANE").map_err(|_| "not running inside a Tern pane".to_owned())?;
 	let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-	let mut args: Vec<String> = ["split", here.as_str(), "right", "--json", "--", &exe.to_string_lossy(), "editor", profile, "--db", &req.db]
+	let (anchor, side) = match editor_pane_beside(&here) {
+		Some(p) => (p, "down"),
+		None => (here, "right"),
+	};
+	let mut args: Vec<String> = ["split", anchor.as_str(), side, "--json", "--", &exe.to_string_lossy(), "editor", profile, "--db", &req.db]
 		.iter()
 		.map(ToString::to_string)
 		.collect();

@@ -614,15 +614,22 @@ fn handle(s: &mut State, p: Pick) -> Flow {
 }
 
 /// Shows the connections and returns a live connection with its profile name and server, or `None` on quit.
-pub fn choose(new: bool) -> anyhow::Result<Option<(Mssql, String, String)>> {
+pub fn choose(new: bool, edit: Option<&str>) -> anyhow::Result<Option<(Mssql, String, String)>> {
 	let Some(mut session) = Session::<Pick>::connect(Options::new())? else {
 		anyhow::bail!("pick a profile by name outside Tern: tern-mssql PROFILE");
 	};
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server"))?;
 	session.stylesheet(sf, "cm", Some(CSS))?;
 	let profiles = profile::load()?;
-	let mode = if new || profiles.is_empty() { Mode::Form(Form::new(None)) } else { Mode::List };
-	let mut s = State { profiles, at: 0, mode, note: String::new(), bad: false };
+	let at = edit.and_then(|n| profiles.iter().position(|p| p.name == n)).unwrap_or(0);
+	let mode = if edit.is_some() && at < profiles.len() {
+		Mode::Form(Form::new(Some(&profiles[at])))
+	} else if new || profiles.is_empty() {
+		Mode::Form(Form::new(None))
+	} else {
+		Mode::List
+	};
+	let mut s = State { profiles, at, mode, note: String::new(), bad: false };
 	session.render(sf, view(&s))?;
 	session.focus(sf, None)?;
 	let chosen = loop {

@@ -78,6 +78,16 @@ enum Msg {
 	CloseTab(usize),
 	/// A divider button was clicked: step the explorer width by this many sizes.
 	Side(i32),
+	/// An environments row was selected.
+	EnvSel(String),
+	/// Connect to an environment, or show its tree when it is connected.
+	EnvConnect(String),
+	/// Drop an environment's connection.
+	EnvDisconnect(String),
+	/// Open the connection form in a pane beside this one: a new connection, or the named one to edit.
+	EnvForm(Option<String>),
+	/// A new empty query on an environment, in its editor pane.
+	EnvQuery(String),
 }
 
 /// Which part of the client this process is.
@@ -447,13 +457,13 @@ struct Popup {
 	sel:  usize,
 }
 
-/// The client's state.
-struct App {
+/// One server connection: its worker thread, databases and loaded catalogs.
+struct Conn {
+	profile:   String,
+	server:    String,
 	worker:    Worker,
 	/// Jobs in the worker, front first.
 	queue:     VecDeque<Pending>,
-	profile:   String,
-	server:    String,
 	databases: Vec<String>,
 	/// The database the connection (and so the editor) is in.
 	current:   String,
@@ -461,6 +471,71 @@ struct App {
 	catalogs:  HashMap<String, Catalog>,
 	/// Databases whose catalog is being loaded.
 	loading:   HashSet<String>,
+}
+
+impl Conn {
+	/// Reads the database list and hands the connection to a worker thread.
+	fn new<B: Backend + Send + 'static>(mut db: B, profile: String, server: String) -> anyhow::Result<Self> {
+		let databases = db.databases()?;
+		let current = db.current()?;
+		Ok(Self { profile, server, worker: Worker::spawn(db), queue: VecDeque::new(), databases, current, catalogs: HashMap::new(), loading: HashSet::new() })
+	}
+
+	/// Queues a job in the worker and returns the note to show.
+	fn start(&mut self, job: Job, what: &'static str) -> String {
+		let cancel = self.worker.submit(job);
+		self.queue.push_back(Pending { since: Instant::now(), what, cancel, asked: false });
+		if self.queue.len() > 1 { format!("{what} queued") } else { format!("{what}... (esc cancels)") }
+	}
+
+	/// Starts loading `db`'s catalog unless it is loaded or loading; the note to show when it starts.
+	fn ensure_catalog(&mut self, db: &str) -> Option<String> {
+		if self.catalogs.contains_key(db) || !self.loading.insert(db.to_owned()) {
+			return None;
+		}
+		Some(self.start(Job::Catalog(db.to_owned()), "loading objects"))
+	}
+}
+
+/// The tree id of a connection's root row.
+fn root_id(profile: &str) -> String {
+	format!("srv{SEP}{profile}")
+}
+
+/// The tree id of a database row.
+fn db_id(profile: &str, db: &str) -> String {
+	format!("db:{profile}{SEP}{db}")
+}
+
+/// A tree id's kind, profile and the rest: `db:prod␟Titan` is `("db:", "prod", "Titan")`, a root `srv␟prod` has an empty rest.
+/// Placeholder rows (`p:` + the row they stand in for) answer for that row.
+fn split_id(id: &str) -> Option<(&str, &str, &str)> {
+	let id = id.strip_prefix("p:").unwrap_or(id);
+	if let Some(rest) = id.strip_prefix("srv") {
+		return Some(("srv", rest.strip_prefix(SEP)?, ""));
+	}
+	let colon = id.find(':')?;
+	let (kind, rest) = id.split_at(colon + 1);
+	let (profile, tail) = rest.split_once(SEP)?;
+	Some((kind, profile, tail))
+}
+
+/// The client's state.
+struct App {
+	/// Connections: an editor has one, an explorer as many as are connected.
+	conns:     Vec<Conn>,
+	/// Saved profiles, for the explorer's environments box.
+	envs:      Vec<crate::profile::Profile>,
+	/// The environments row selected.
+	env_at:    usize,
+	/// Keys go to the environments box rather than the tree.
+	in_envs:   bool,
+	/// Connections being opened on a thread, by profile name.
+	connecting: Vec<(String, std::sync::mpsc::Receiver<anyhow::Result<Conn>>)>,
+	/// Why an environment failed to connect, by profile name.
+	env_fail:  HashMap<String, String>,
+	/// `profiles.json` as last read, so edits made in a form pane show up.
+	envs_seen: Option<std::time::SystemTime>,
 	buffers:   Vec<Buffer>,
 	active:    usize,
 	next_id:   usize,
@@ -520,9 +595,9 @@ fn flat(cell: &str) -> String {
 
 impl App {
 	/// Loads the server's database list, starts the catalog load and hands the connection to the worker.
-	fn new<B: Backend + Send + 'static>(mut db: B, profile: String, server: String, files: &[PathBuf]) -> anyhow::Result<Self> {
-		let databases = db.databases()?;
-		let current = db.current()?;
+	fn new<B: Backend + Send + 'static>(db: B, profile: String, server: String, files: &[PathBuf]) -> anyhow::Result<Self> {
+		let conn = Conn::new(db, profile, server)?;
+		let current = conn.current.clone();
 		let mut buffers: Vec<Buffer> = Vec::new();
 		for (i, f) in files.iter().enumerate() {
 			let mut b = Buffer::new(
@@ -535,21 +610,21 @@ impl App {
 		if buffers.is_empty() {
 			buffers.push(Buffer::new("SQLQuery_1.sql".into(), String::new()));
 		}
+		let expanded = [root_id(&conn.profile), db_id(&conn.profile, &current), format!("g:{}{SEP}{current}:tables", conn.profile)].into();
 		let mut app = Self {
-			worker: Worker::spawn(db),
-			queue: VecDeque::new(),
-			profile,
-			server,
-			databases,
-			current: current.clone(),
-			catalogs: HashMap::new(),
-			loading: HashSet::new(),
+			conns: vec![conn],
+			envs: Vec::new(),
+			env_at: 0,
+			in_envs: false,
+			connecting: Vec::new(),
+			env_fail: HashMap::new(),
+			envs_seen: None,
 			next_id: buffers.len() + 1,
 			buffers,
 			active: 0,
 			out: Output::default(),
 			popup: None,
-			expanded: ["srv".to_owned(), format!("db:{current}"), format!("g:{current}:tables")].into(),
+			expanded,
 			note: String::new(),
 			write: false,
 			in_editor: true,
@@ -570,21 +645,37 @@ impl App {
 			by_schema: true,
 			remote: None,
 		};
-		app.ensure_catalog(&current);
+		app.ensure_catalog(0, &current);
 		Ok(app)
 	}
 
 	/// The catalog of the database the editor is in.
 	fn catalog(&self) -> Option<&Catalog> {
-		self.catalogs.get(&self.current)
+		let c = self.conns.first()?;
+		c.catalogs.get(&c.current)
 	}
 
-	/// Starts loading `db`'s catalog unless it is loaded or loading.
-	fn ensure_catalog(&mut self, db: &str) {
-		if self.catalogs.contains_key(db) || !self.loading.insert(db.to_owned()) {
-			return;
+	/// The editor's profile name (empty in an explorer with nothing connected).
+	fn profile(&self) -> &str {
+		self.conns.first().map_or("", |c| c.profile.as_str())
+	}
+
+	/// The database the editor is in (empty in an explorer with nothing connected).
+	fn current(&self) -> &str {
+		self.conns.first().map_or("", |c| c.current.as_str())
+	}
+
+	/// The connection a tree row belongs to.
+	fn conn_of(&self, id: &str) -> Option<usize> {
+		let (_, profile, _) = split_id(id)?;
+		self.conns.iter().position(|c| c.profile == profile)
+	}
+
+	/// Starts loading `db`'s catalog on connection `ci` unless it is loaded or loading.
+	fn ensure_catalog(&mut self, ci: usize, db: &str) {
+		if let Some(note) = self.conns.get_mut(ci).and_then(|c| c.ensure_catalog(db)) {
+			self.note = note;
 		}
-		self.start(Job::Catalog(db.to_owned()), "loading objects");
 	}
 
 	/// Lines the work area can use: the pane less the status bar.
@@ -639,6 +730,11 @@ impl App {
 		(self.avail_lines() - 5.0 - self.editor_lines() - self.prompt_lines()).max(3.0)
 	}
 
+	/// A query tab's label: the environment it runs on, then the buffer, so a script is never run on the wrong server by mistake.
+	fn tab_label(&self, b: &Buffer) -> String {
+		format!("{} - {}", self.profile().to_uppercase(), b.name)
+	}
+
 	/// The editor's node id.
 	fn editor_id(&self) -> String {
 		format!("main.body.work.ed{}", self.epoch)
@@ -648,19 +744,27 @@ impl App {
 		&mut self.buffers[self.active]
 	}
 
-	/// Queues a job in the worker.
+	/// Queues a job in the editor's worker.
 	fn start(&mut self, job: Job, what: &'static str) {
-		let cancel = self.worker.submit(job);
-		self.queue.push_back(Pending { since: Instant::now(), what, cancel, asked: false });
-		self.note = if self.queue.len() > 1 { format!("{what} queued") } else { format!("{what}... (esc cancels)") };
+		self.start_on(0, job, what);
+	}
+
+	/// Queues a job in connection `ci`'s worker.
+	fn start_on(&mut self, ci: usize, job: Job, what: &'static str) {
+		if let Some(c) = self.conns.get_mut(ci) {
+			self.note = c.start(job, what);
+		}
 	}
 
 	/// Asks the running job to stop.
 	fn cancel(&mut self) {
-		if let Some(p) = self.queue.front_mut().filter(|p| !p.asked) {
-			p.cancel.cancel();
-			p.asked = true;
-			self.note = "cancelling...".into();
+		for c in &mut self.conns {
+			if let Some(p) = c.queue.front_mut().filter(|p| !p.asked) {
+				p.cancel.cancel();
+				p.asked = true;
+				self.note = "cancelling...".into();
+				return;
+			}
 		}
 	}
 
@@ -694,7 +798,7 @@ impl App {
 	fn snapshot(&self) -> crate::session::Saved {
 		crate::session::Saved {
 			cwd:     std::env::current_dir().unwrap_or_default().display().to_string(),
-			profile: self.profile.clone(),
+			profile: self.profile().to_owned(),
 			active:  self.active,
 			buffers: self
 				.buffers
@@ -737,13 +841,13 @@ impl App {
 		if !snap.worth_keeping() {
 			// Everything was closed: forget the old session too.
 			if !self.saved_json.is_empty() {
-				let _ = std::fs::remove_file(crate::session::path(&self.profile));
+				let _ = std::fs::remove_file(crate::session::path(self.profile()));
 				self.saved_json.clear();
 			}
 			return;
 		}
 		let Ok(json) = serde_json::to_string(&snap) else { return };
-		if json != self.saved_json && crate::session::store(&self.profile, &snap).is_ok() {
+		if json != self.saved_json && crate::session::store(self.profile(), &snap).is_ok() {
 			self.saved_json = json;
 		}
 	}
@@ -1000,54 +1104,58 @@ impl App {
 			return;
 		}
 		let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-		let db: String = self.current.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+		let db: String = self.current().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
 		self.start(Job::Export { sql, path: PathBuf::from(format!("tern-mssql-{db}-{stamp}.csv")) }, "exporting");
 	}
 
-	/// Takes the worker's reply, if a job finished. Returns whether anything changed.
+	/// Takes the workers' replies, if jobs finished. Returns whether anything changed.
 	fn poll(&mut self) -> bool {
-		let Some(reply) = self.worker.poll() else {
-			if let Some(p) = self.queue.front().filter(|p| !p.asked) {
-				self.note = format!("{} {}s (esc cancels)", p.what, p.since.elapsed().as_secs());
-				return true;
-			}
-			return false;
-		};
-		let since = self.queue.pop_front().map(|p| p.since);
-		let took = since.map_or(0, |s| s.elapsed().as_millis());
-		self.note.clear();
-		match reply {
-			Reply::Ran(RunResult { sets, messages, ms, error }) => {
-				self.note = format!("{ms} ms");
-				let tab = if error.is_some() || sets.is_empty() { sets.len() } else { 0 };
-				self.out = Output { sets, messages, error: error.is_some(), tab, ..Output::default() };
-				self.grid_focus = false;
-			},
-			Reply::Exported(Ok((path, n))) => {
-				let full = std::fs::canonicalize(&path).unwrap_or(path);
-				self.note = format!("{n} rows in {took} ms to {}", full.display());
-			},
-			Reply::Exported(Err(e)) => self.show_error(e),
-			Reply::Switched(name, Ok(())) => {
-				self.current = name;
-				self.popup = None;
-			},
-			Reply::Switched(_, Err(e)) => self.show_error(e),
-			Reply::Catalog(name, result) => {
-				self.loading.remove(&name);
-				match result {
-					Ok(cat) => {
-						self.catalogs.insert(name, cat);
-					},
-					Err(e) => self.show_error(e),
+		let mut changed = false;
+		for ci in 0..self.conns.len() {
+			let Some(reply) = self.conns[ci].worker.poll() else {
+				if let Some(p) = self.conns[ci].queue.front().filter(|p| !p.asked) {
+					self.note = format!("{} {}s (esc cancels)", p.what, p.since.elapsed().as_secs());
+					changed = true;
 				}
-			},
-			Reply::Cancelled => self.note = "cancelled".into(),
+				continue;
+			};
+			let since = self.conns[ci].queue.pop_front().map(|p| p.since);
+			let took = since.map_or(0, |s| s.elapsed().as_millis());
+			self.note.clear();
+			match reply {
+				Reply::Ran(RunResult { sets, messages, ms, error }) => {
+					self.note = format!("{ms} ms");
+					let tab = if error.is_some() || sets.is_empty() { sets.len() } else { 0 };
+					self.out = Output { sets, messages, error: error.is_some(), tab, ..Output::default() };
+					self.grid_focus = false;
+				},
+				Reply::Exported(Ok((path, n))) => {
+					let full = std::fs::canonicalize(&path).unwrap_or(path);
+					self.note = format!("{n} rows in {took} ms to {}", full.display());
+				},
+				Reply::Exported(Err(e)) => self.show_error(e),
+				Reply::Switched(name, Ok(())) => {
+					self.conns[ci].current = name;
+					self.popup = None;
+				},
+				Reply::Switched(_, Err(e)) => self.show_error(e),
+				Reply::Catalog(name, result) => {
+					self.conns[ci].loading.remove(&name);
+					match result {
+						Ok(cat) => {
+							self.conns[ci].catalogs.insert(name, cat);
+						},
+						Err(e) => self.show_error(e),
+					}
+				},
+				Reply::Cancelled => self.note = "cancelled".into(),
+			}
+			if let Some(p) = self.conns[ci].queue.front() {
+				self.note = format!("{} (esc cancels)", p.what);
+			}
+			changed = true;
 		}
-		if let Some(p) = self.queue.front() {
-			self.note = format!("{} (esc cancels)", p.what);
-		}
-		true
+		changed
 	}
 
 	fn show_error(&mut self, e: String) {
@@ -1060,87 +1168,95 @@ impl App {
 			self.fold(id);
 			return;
 		}
-		if let Some(name) = id.strip_prefix("db:") {
-			self.ensure_catalog(name);
-			if name != self.current {
-				self.start(Job::Switch(name.to_owned()), "switching");
-			}
-		} else if let Some(full) = id.strip_prefix("o:") {
-			let mut parts = full.splitn(3, SEP);
-			let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
-			let Some(kind) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)).map(|o| o.kind) else { return };
-			// An object in another database is reached by its three-part name, so the editor's database stays put.
-			let q = self.qualify(db, schema, name);
-			let sql = match kind {
-				ObjKind::Table | ObjKind::View => format!("SELECT TOP (1000) *\nFROM {q}"),
-				ObjKind::Proc => format!("EXEC {q}"),
-				ObjKind::Func => format!("SELECT * FROM {q}()"),
-			};
-			self.open_sql(db, sql, matches!(kind, ObjKind::Table | ObjKind::View));
+		let Some((kind, _, tail)) = split_id(id) else { return };
+		let Some(ci) = self.conn_of(id) else { return };
+		match kind {
+			"db:" => {
+				self.ensure_catalog(ci, tail);
+				if tail != self.conns[ci].current {
+					self.start_on(ci, Job::Switch(tail.to_owned()), "switching");
+				}
+			},
+			"o:" => {
+				let mut parts = tail.splitn(3, SEP);
+				let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
+				let Some(kind) = self.conns[ci].catalogs.get(db).and_then(|c| c.find(Some(schema), name)).map(|o| o.kind) else { return };
+				// An object in another database is reached by its three-part name, so the editor's database stays put.
+				let q = self.qualify(ci, db, schema, name);
+				let sql = match kind {
+					ObjKind::Table | ObjKind::View => format!("SELECT TOP (1000) *\nFROM {q}"),
+					ObjKind::Proc => format!("EXEC {q}"),
+					ObjKind::Func => format!("SELECT * FROM {q}()"),
+				};
+				self.open_sql(ci, db, sql, matches!(kind, ObjKind::Table | ObjKind::View));
+			},
+			_ => {},
 		}
 	}
 
 	/// Opens a new buffer holding generated T-SQL for the selected table or view.
 	fn script_selected(&mut self, kind: script::Kind) {
-		let Some(full) = self.picked.as_deref().and_then(|id| id.strip_prefix("o:")) else {
+		let Some((ci, tail)) = self.picked.as_deref().and_then(|id| Some((self.conn_of(id)?, split_id(id).filter(|(k, ..)| *k == "o:")?.2))) else {
 			self.note = "select a table or view first".into();
 			return;
 		};
-		let mut parts = full.splitn(3, SEP);
+		let mut parts = tail.splitn(3, SEP);
 		let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
-		let db = db.to_owned();
-		let db = db.as_str();
-		let Some(obj) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)) else { return };
+		let (db, schema, name) = (db.to_owned(), schema.to_owned(), name.to_owned());
+		let Some(obj) = self.conns[ci].catalogs.get(&db).and_then(|c| c.find(Some(&schema), &name)) else { return };
 		if !matches!(obj.kind, ObjKind::Table | ObjKind::View) {
 			self.note = "script as works on tables and views".into();
 			return;
 		}
-		let q = self.qualify(db, schema, name);
+		let q = self.qualify(ci, &db, &schema, &name);
 		let sql = script::generate(kind, obj, &q);
 		// A SELECT is safe to run on the spot; the other scripts need their placeholders filled in first.
-		self.open_sql(db, sql, matches!(kind, script::Kind::Select));
+		self.open_sql(ci, &db, sql, matches!(kind, script::Kind::Select));
 	}
 
-	/// The database the selected explorer row belongs to.
-	fn picked_db(&self) -> Option<String> {
+	/// The connection and database the selected explorer row belongs to.
+	fn picked_db(&self) -> Option<(usize, String)> {
 		let id = self.picked.as_deref()?;
-		if let Some(db) = id.strip_prefix("db:") {
-			Some(db.to_owned())
-		} else if let Some(rest) = id.strip_prefix("o:") {
-			rest.split(SEP).next().map(str::to_owned)
-		} else {
-			// Folders are `g:<db>:<group>`; the group never holds a colon.
-			id.strip_prefix("g:").and_then(|r| r.rsplit_once(':')).map(|(db, _)| db.to_owned())
-		}
+		let ci = self.conn_of(id)?;
+		let (kind, _, tail) = split_id(id)?;
+		let db = match kind {
+			"db:" => tail.to_owned(),
+			"o:" | "c:" => tail.split(SEP).next()?.to_owned(),
+			// Folders are `g:<profile>␟<db>:<group>[␟<schema>]`; neither the group nor the schema holds a colon.
+			"g:" => tail.rsplit_once(':')?.0.to_owned(),
+			_ => return None,
+		};
+		Some((ci, db))
 	}
 
 	/// Runs a database menu item on the selected row's database.
 	fn db_action(&mut self, act: DbAct) {
-		let Some(db) = self.picked_db() else {
+		let Some((ci, db)) = self.picked_db() else {
 			self.note = "select a database first".into();
 			return;
 		};
+		let id = db_id(&self.conns[ci].profile, &db);
 		match act {
-			DbAct::Use => self.activate(&format!("db:{db}")),
-			DbAct::NewQuery if self.role == Role::Explorer => self.open_sql(&db, String::new(), false),
+			DbAct::Use => self.activate(&id),
+			DbAct::NewQuery if self.role == Role::Explorer => self.open_sql(ci, &db, String::new(), false),
 			DbAct::NewQuery => {
-				self.activate(&format!("db:{db}"));
+				self.activate(&id);
 				self.new_buffer(String::new());
 			},
 			DbAct::Refresh => {
-				self.catalogs.remove(&db);
-				self.ensure_catalog(&db);
+				self.conns[ci].catalogs.remove(&db);
+				self.ensure_catalog(ci, &db);
 			},
 		}
 	}
 
 	/// An object's name as the editor should write it: the editor is switched to the object's database, so two parts suffice there.
-	fn qualify(&self, db: &str, schema: &str, name: &str) -> String {
-		if self.role == Role::Explorer || db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) }
+	fn qualify(&self, ci: usize, db: &str, schema: &str, name: &str) -> String {
+		if self.role == Role::Explorer || db == self.conns[ci].current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) }
 	}
 
-	/// Opens `sql` on `db`: in an editor pane from the explorer, in a new buffer otherwise.
-	fn open_sql(&mut self, db: &str, sql: String, run: bool) {
+	/// Opens `sql` on `db` of connection `ci`: in an editor pane from the explorer, in a new buffer otherwise.
+	fn open_sql(&mut self, ci: usize, db: &str, sql: String, run: bool) {
 		if self.role != Role::Explorer {
 			self.new_buffer(sql.clone());
 			if run {
@@ -1148,8 +1264,9 @@ impl App {
 			}
 			return;
 		}
-		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run, quiet: false }, true) {
-			Ok(()) => format!("opened in the editor ({db})"),
+		let profile = self.conns[ci].profile.clone();
+		self.note = match remote::open(&profile, &remote::Request { profile: profile.clone(), db: db.to_owned(), sql, run, quiet: false }, true) {
+			Ok(()) => format!("opened in the {profile} editor ({db})"),
 			Err(e) => e,
 		};
 	}
@@ -1157,8 +1274,8 @@ impl App {
 	/// An editor pane: opens what the explorer sent, switching to its database first.
 	fn open_remote(&mut self, r: remote::Request) {
 		if !r.db.is_empty() {
-			self.ensure_catalog(&r.db);
-			if r.db != self.current {
+			self.ensure_catalog(0, &r.db);
+			if r.db != self.current() {
 				self.start(Job::Switch(r.db.clone()), "switching");
 			}
 		}
@@ -1184,8 +1301,9 @@ impl App {
 	/// Recomputes the completion popup after an edit or on request.
 	fn complete(&mut self, force: bool) {
 		let b = &self.buffers[self.active];
-		self.popup = complete::complete(&b.text, b.cursor_byte(), self.catalog(), &self.databases, force)
-			.map(|comp| Popup { comp, sel: 0 });
+		let dbs = self.conns.first().map_or(&[][..], |c| c.databases.as_slice());
+		let popup = complete::complete(&b.text, b.cursor_byte(), self.catalog(), dbs, force).map(|comp| Popup { comp, sel: 0 });
+		self.popup = popup;
 	}
 
 	/// Inserts the selected suggestion.
@@ -1201,28 +1319,33 @@ impl App {
 		b.dirty = true;
 	}
 
-	/// The explorer's root item, with every database under it.
-	fn explorer_root(&self) -> TreeItem {
+	/// One root per connection, with its databases under it.
+	fn explorer_roots(&self) -> Vec<TreeItem> {
 		let open = |id: &str| self.expanded.contains(id);
-		let mut srv = TreeItem::new("srv", vec![span(self.profile.clone(), "strong"), span(format!("  {}", self.server), "dim")])
-			.open(open("srv"));
-		srv.icon = Some("server".into());
-		for d in &self.databases {
-			let id = format!("db:{d}");
-			let label = if *d == self.current && self.role != Role::Explorer { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
-			let mut item = TreeItem::new(id.clone(), label).open(open(&id));
-			item.icon = Some("database".into());
-			item.children = match self.catalogs.get(d) {
-				Some(cat) => self.catalog_items(d, cat),
-				None => {
-					// A child keeps the chevron; opening the database loads its objects.
-					let text = if self.loading.contains(d) { "loading objects..." } else { "..." };
-					vec![TreeItem::new(format!("p:{id}"), vec![span(text, "dim")])]
-				},
-			};
-			srv = srv.child(item);
-		}
-		srv
+		self.conns
+			.iter()
+			.map(|c| {
+				let rid = root_id(&c.profile);
+				let mut srv = TreeItem::new(rid.clone(), vec![span(c.profile.clone(), "strong"), span(format!("  {}", c.server), "dim")]).open(open(&rid));
+				srv.icon = Some("server".into());
+				for d in &c.databases {
+					let id = db_id(&c.profile, d);
+					let label = if *d == c.current && self.role != Role::Explorer { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
+					let mut item = TreeItem::new(id.clone(), label).open(open(&id));
+					item.icon = Some("database".into());
+					item.children = match c.catalogs.get(d) {
+						Some(cat) => self.catalog_items(&c.profile, d, cat),
+						None => {
+							// A child keeps the chevron; opening the database loads its objects.
+							let text = if c.loading.contains(d) { "loading objects..." } else { "..." };
+							vec![TreeItem::new(format!("p:{id}"), vec![span(text, "dim")])]
+						},
+					};
+					srv = srv.child(item);
+				}
+				srv
+			})
+			.collect()
 	}
 
 	/// The rows showing now, each with its depth.
@@ -1235,12 +1358,19 @@ impl App {
 		}
 	}
 
+	/// The tree rows showing now, over every connection.
+	fn shown(&self) -> Vec<(TreeItem, usize)> {
+		let roots = self.explorer_roots();
+		let mut shown = Vec::new();
+		for r in &roots {
+			Self::visible(r, 0, &mut shown);
+		}
+		shown.into_iter().map(|(i, d)| (i.clone(), d)).collect()
+	}
+
 	/// The explorer: every row is an `el`, so each can carry its own right-click menu.
 	fn explorer(&self) -> ui::Col<Msg> {
-		let root = self.explorer_root();
-		let mut shown = Vec::new();
-		Self::visible(&root, 0, &mut shown);
-		let rows = shown.into_iter().map(|(item, depth)| {
+		let rows = self.shown().into_iter().map(|(item, depth)| {
 			let id = item.id.clone();
 			let has_kids = !item.children.is_empty();
 			let icon = serde_json::to_value(&item.icon).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
@@ -1272,8 +1402,11 @@ impl App {
 				for (name, act) in acts {
 					row = row.on_menu(name, Msg::DbRow(id.clone(), act));
 				}
-			} else if id == "srv" {
+			} else if id.starts_with("srv") {
 				row = row.on_menu(if self.by_schema { "List objects as schema.name" } else { "Group objects by schema" }, Msg::GroupToggle);
+				if self.role == Role::Explorer && let Some((_, profile, _)) = split_id(&id) {
+					row = row.on_menu("Disconnect", Msg::EnvDisconnect(profile.to_owned()));
+				}
 			} else if id.starts_with("o:") {
 				for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
 					row = row.on_menu(kind.act(), Msg::ScriptRow(id.clone(), kind));
@@ -1281,28 +1414,224 @@ impl App {
 			}
 			row
 		});
-		ui::col()
+		let tree = html::div().class("tree").children(rows);
+		let col = ui::col()
 			.key("side")
 			.basis(ui::Basis::Content)
 			.grow(if self.role == Role::Explorer { 1.0 } else { 0.0 })
 			.shrink(1.0)
 			.min(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
-			.max(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
-			.child(html::div().class("tree").children(rows))
+			.max(ui::Bound::h(ui::Extent::Lines(self.avail_lines())));
+		if self.role == Role::Explorer {
+			col.child(html::div().class("side").child(self.envs_box()).child(tree))
+		} else {
+			col.child(tree)
+		}
+	}
+
+	/// The environments box: every saved connection with its state, and the buttons that act on the selected one.
+	fn envs_box(&self) -> html::El<Msg> {
+		let mut list = html::div().class(if self.in_envs { "envs focus" } else { "envs" }).child(
+			html::div()
+				.class("eh")
+				.child(html::span("Environments"))
+				.child(html::span(format!("{} of {} connected", self.conns.len(), self.envs.len())).class("s-dim")),
+		);
+		for (i, p) in self.envs.iter().enumerate() {
+			let on = self.conns.iter().any(|c| c.profile == p.name);
+			let busy = self.connecting.iter().any(|(n, _)| *n == p.name);
+			let failed = self.env_fail.contains_key(&p.name);
+			let (mark, cls) = if on { ("●", "s-accent") } else if busy { ("…", "s-dim") } else if failed { ("!", "s-bad") } else { ("○", "s-dim") };
+			let state = if i == self.env_at && self.in_envs { " cur" } else if i == self.env_at { " sel" } else { "" };
+			let mut row = html::div()
+				.class(format!("er{state}"))
+				.on_click(Msg::EnvSel(p.name.clone()))
+				.on_dblclick(Msg::EnvConnect(p.name.clone()))
+				.child(html::span(mark).class(format!("em {cls}")))
+				.child(html::span(p.name.clone()).class("s-strong"))
+				.child(html::span(if p.user.is_empty() { p.server.clone() } else { format!("{} @ {}", p.user, p.server) }).class("s-dim ed"));
+			row = if on { row.on_menu("New query", Msg::EnvQuery(p.name.clone())).on_menu("Disconnect", Msg::EnvDisconnect(p.name.clone())) } else { row.on_menu("Connect", Msg::EnvConnect(p.name.clone())) };
+			row = row.on_menu("Edit connection", Msg::EnvForm(Some(p.name.clone()))).on_menu("New connection", Msg::EnvForm(None));
+			list = list.child(row);
+		}
+		let sel = self.envs.get(self.env_at).map(|p| p.name.clone());
+		let on = sel.as_ref().is_some_and(|n| self.conns.iter().any(|c| c.profile == *n));
+		let bt = |label: &str, msg: Msg| html::span(label.to_owned()).class("bt").on_click(msg);
+		let mut bar = html::div().class("ebar");
+		if let Some(n) = sel.clone() {
+			if on {
+				bar = bar.child(bt("New query", Msg::EnvQuery(n.clone()))).child(bt("Disconnect", Msg::EnvDisconnect(n)));
+			} else {
+				bar = bar.child(bt("Connect", Msg::EnvConnect(n)));
+			}
+		}
+		bar = bar.child(bt("New", Msg::EnvForm(None)));
+		if let Some(n) = sel {
+			bar = bar.child(bt("Edit", Msg::EnvForm(Some(n))));
+		}
+		list.child(bar)
+	}
+
+	/// Reads the saved profiles for the environments box when `profiles.json` changed.
+	fn load_envs(&mut self) {
+		let seen = std::fs::metadata(crate::profile::path()).and_then(|m| m.modified()).ok();
+		if seen.is_some() && seen == self.envs_seen {
+			return;
+		}
+		self.envs_seen = seen;
+		if let Ok(p) = crate::profile::load() {
+			self.envs = p;
+		}
+		self.env_at = self.env_at.min(self.envs.len().saturating_sub(1));
+	}
+
+	/// Opens a connection to environment `name` on a thread; `poll_connects` takes the result. A connected one shows its tree.
+	fn env_connect(&mut self, name: &str) {
+		if let Some(i) = self.envs.iter().position(|p| p.name == name) {
+			self.env_at = i;
+		}
+		if self.conns.iter().any(|c| c.profile == name) {
+			self.expanded.insert(root_id(name));
+			self.picked = Some(root_id(name));
+			self.in_envs = false;
+			return;
+		}
+		if self.connecting.iter().any(|(n, _)| n == name) {
+			return;
+		}
+		let Some(p) = self.envs.iter().find(|p| p.name == name).cloned() else { return };
+		self.env_fail.remove(name);
+		let (tx, rx) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let conn = (|| {
+				let db = crate::backend::mssql::Mssql::connect(&p.ado()?)?;
+				Conn::new(db, p.name.clone(), p.server.clone())
+			})();
+			let _ = tx.send(conn);
+		});
+		self.connecting.push((name.to_owned(), rx));
+		self.note = format!("connecting to {name}...");
+	}
+
+	/// Takes connections that finished opening. True when something changed.
+	fn poll_connects(&mut self) -> bool {
+		let mut changed = false;
+		let mut i = 0;
+		while i < self.connecting.len() {
+			match self.connecting[i].1.try_recv() {
+				Ok(result) => {
+					let (name, _) = self.connecting.remove(i);
+					match result {
+						Ok(conn) => {
+							self.expanded.insert(root_id(&name));
+							self.picked = Some(root_id(&name));
+							self.note = format!("connected to {name}");
+							self.conns.push(conn);
+							self.remember_envs();
+						},
+						Err(e) => {
+							self.note = format!("{name}: {e:#}");
+							self.env_fail.insert(name, format!("{e:#}"));
+						},
+					}
+					changed = true;
+				},
+				Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+				Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+					self.connecting.remove(i);
+					changed = true;
+				},
+			}
+		}
+		changed
+	}
+
+	/// A new empty query on environment `name`, in that environment's editor pane (opened if need be).
+	fn env_query(&mut self, name: &str) {
+		let Some(ci) = self.conns.iter().position(|c| c.profile == name) else {
+			self.note = format!("{name} is not connected: press Enter on it first");
+			return;
+		};
+		let db = self.conns[ci].current.clone();
+		self.open_sql(ci, &db, String::new(), false);
+	}
+
+	/// Remembers which environments are connected, for the next start in this directory.
+	fn remember_envs(&self) {
+		let names: Vec<String> = self.conns.iter().map(|c| c.profile.clone()).collect();
+		let _ = crate::session::store_envs(&names);
+	}
+
+	/// Drops environment `name`'s connection and its rows. Its editor panes keep their own connection.
+	fn env_disconnect(&mut self, name: &str) {
+		let Some(i) = self.conns.iter().position(|c| c.profile == name) else { return };
+		self.conns.remove(i);
+		self.expanded.retain(|id| split_id(id).is_none_or(|(_, p, _)| p != name));
+		if self.picked.as_deref().and_then(split_id).is_some_and(|(_, p, _)| p == name) {
+			self.picked = None;
+		}
+		self.note = format!("disconnected {name}");
+		self.remember_envs();
+	}
+
+	/// Opens the connection form in a pane below this one: blank, or on `name` to edit it.
+	fn env_form(&mut self, name: Option<&str>) {
+		let Ok(here) = std::env::var("TERN_PANE") else {
+			self.note = "not running inside a Tern pane".into();
+			return;
+		};
+		let Ok(exe) = std::env::current_exe() else { return };
+		let mut args = vec!["split".to_owned(), here, "down".to_owned(), "--".to_owned(), exe.to_string_lossy().into_owned()];
+		match name {
+			Some(n) => args.extend(["--edit".to_owned(), n.to_owned()]),
+			None => args.push("--new".to_owned()),
+		}
+		self.note = match std::process::Command::new("tern").args(&args).output() {
+			Ok(o) if o.status.success() => "the form is open below; it saves to profiles.json".to_owned(),
+			Ok(o) => format!("tern split failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+			Err(e) => format!("tern split failed: {e}"),
+		};
+	}
+
+	/// Keys while the environments box has focus. False when the key is not for it.
+	fn env_key(&mut self, key: &tern_sdk::keys::Key) -> bool {
+		let n = self.envs.len();
+		let sel = self.envs.get(self.env_at).map(|p| p.name.clone());
+		match (key.name.as_str(), key.typed()) {
+			("down", _) => self.env_at = (self.env_at + 1).min(n.saturating_sub(1)),
+			("up", _) => self.env_at = self.env_at.saturating_sub(1),
+			("enter", _) => {
+				if let Some(s) = sel {
+					self.env_connect(&s);
+				}
+			},
+			(_, Some("x")) | (_, Some("d")) => {
+				if let Some(s) = sel {
+					self.env_disconnect(&s);
+				}
+			},
+			(_, Some("n")) => self.env_form(None),
+			(_, Some("e")) => self.env_form(sel.as_deref()),
+			(_, Some("q")) => {
+				if let Some(s) = sel {
+					self.env_query(&s);
+				}
+			},
+			_ => return false,
+		}
+		true
 	}
 
 	/// Keys while the explorer has focus: arrows move and fold, enter opens. False when the key is not for the explorer.
 	fn tree_key(&mut self, key: &tern_sdk::keys::Key) -> bool {
-		let root = self.explorer_root();
-		let mut shown = Vec::new();
-		Self::visible(&root, 0, &mut shown);
+		let shown = self.shown();
 		let at = self.picked.as_deref().and_then(|p| shown.iter().position(|(i, _)| i.id == p));
 		let go = |n: usize| shown.get(n).map(|(i, _)| i.id.clone());
 		match key.name.as_str() {
 			"down" => self.picked = go(at.map_or(0, |a| a + 1)).or(self.picked.take()),
 			"up" => self.picked = go(at.map_or(0, |a| a.saturating_sub(1))).or(self.picked.take()),
 			"right" | "left" => {
-				let Some((item, depth)) = at.and_then(|a| shown.get(a)).copied() else { return true };
+				let Some((item, depth)) = at.and_then(|a| shown.get(a)) else { return true };
 				let open = item.open.unwrap_or(false);
 				let id = item.id.clone();
 				if key.name == "right" && !open && !item.children.is_empty() {
@@ -1311,7 +1640,7 @@ impl App {
 					self.fold(&id);
 				} else if key.name == "left" {
 					// To the parent: the nearest row above with a smaller depth.
-					let parent = shown[..at.unwrap_or(0)].iter().rev().find(|(_, d)| *d < depth).map(|(i, _)| i.id.clone());
+					let parent = shown[..at.unwrap_or(0)].iter().rev().find(|(_, d)| d < depth).map(|(i, _)| i.id.clone());
 					self.picked = parent.or(self.picked.take());
 				} else if key.name == "right" {
 					self.picked = go(at.map_or(0, |a| a + 1)).or(self.picked.take());
@@ -1332,15 +1661,16 @@ impl App {
 	fn fold(&mut self, id: &str) {
 		if !self.expanded.remove(id) {
 			self.expanded.insert(id.to_owned());
-			if let Some(db) = id.strip_prefix("db:") {
-				self.ensure_catalog(db);
+			if let (Some(ci), Some(("db:", _, db))) = (self.conn_of(id), split_id(id)) {
+				let db = db.to_owned();
+				self.ensure_catalog(ci, &db);
 			}
 		}
 	}
 
 	/// A double click or enter on a row: folders fold, databases and objects open.
 	fn open_row(&mut self, id: &str) {
-		if id.starts_with("g:") || id == "srv" {
+		if id.starts_with("g:") || id.starts_with("srv") {
 			self.fold(id);
 		} else {
 			self.activate(id);
@@ -1348,9 +1678,9 @@ impl App {
 	}
 
 	/// One database's folders and objects.
-	fn catalog_items(&self, db: &str, cat: &Catalog) -> Vec<TreeItem> {
+	fn catalog_items(&self, profile: &str, db: &str, cat: &Catalog) -> Vec<TreeItem> {
 		let folder = |group: &str, title: &str, count: usize| {
-			let id = format!("g:{db}:{group}");
+			let id = format!("g:{profile}{SEP}{db}:{group}");
 			let is_open = self.expanded.contains(&id);
 			let mut f = TreeItem::new(id, vec![span(title.to_owned(), ""), span(format!("  {count}"), "dim")]).open(is_open);
 			f.icon = Some(if is_open { "folder-open" } else { "folder" }.into());
@@ -1360,7 +1690,7 @@ impl App {
 			let mut all: Vec<(String, TreeItem)> = cat
 				.of(kind)
 				.map(|o| {
-					let id = format!("o:{db}{SEP}{}{SEP}{}", o.schema, o.name);
+					let id = format!("o:{profile}{SEP}{db}{SEP}{}{SEP}{}", o.schema, o.name);
 					let label = if self.by_schema { vec![span(o.name.clone(), "")] } else { vec![span(format!("{}.", o.schema), "dim"), span(o.name.clone(), "")] };
 					let mut item = TreeItem::new(id.clone(), label).open(self.expanded.contains(&id));
 					item.icon = Some(icon.into());
@@ -1368,7 +1698,7 @@ impl App {
 						if self.expanded.contains(&id) {
 							for c in &o.columns {
 								let mut col = TreeItem::new(
-									format!("c:{db}{SEP}{}{SEP}{}{SEP}{}", o.schema, o.name, c.name),
+									format!("c:{profile}{SEP}{db}{SEP}{}{SEP}{}{SEP}{}", o.schema, o.name, c.name),
 									vec![
 										span(c.name.clone(), if c.key { "strong" } else { "" }),
 										span(format!("  {}{}", c.ty, if c.nullable { "" } else { " not null" }), "dim"),
@@ -1457,7 +1787,7 @@ impl App {
 	fn save_view(&mut self, json: bool) {
 		let Some(set) = self.out.sets.get(self.out.tab) else { return };
 		let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-		let db: String = self.current.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+		let db: String = self.current().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
 		let (ext, text) = if json {
 			("json", crate::view::json(&set.columns, &set.rows))
 		} else {
@@ -1703,7 +2033,7 @@ impl App {
 				.on_click(Msg::Tab(i.to_string()))
 				.on_menu("Close tab", Msg::CloseTab(i))
 				.on_menu("New query tab", Msg::NewTab)
-				.child(html::span(buf.name.clone()));
+				.child(html::span(self.tab_label(buf)));
 			if buf.unsaved() {
 				tab = tab.child(html::span("●").class("s-accent"));
 			}
@@ -1793,7 +2123,15 @@ impl App {
 			Role::Whole => row.child(self.explorer()).child(side).child(self.work()),
 		};
 		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
-		let mut status = ui::status().key("bar").child(ui::seg(format!("{} / {}", self.profile, if self.role == Role::Explorer { self.server.as_str() } else { self.current.as_str() })).icon("database"));
+		let head = if self.role == Role::Explorer {
+			match self.conns.len() {
+				0 => "no connection".to_owned(),
+				_ => self.conns.iter().map(|c| c.profile.as_str()).collect::<Vec<_>>().join(", "),
+			}
+		} else {
+			format!("{} / {}", self.profile(), self.current())
+		};
+		let mut status = ui::status().key("bar").child(ui::seg(head).icon("database"));
 		if self.role != Role::Explorer {
 			status = status
 				.child(ui::seg(format!("Ln {line}, Col {col}")))
@@ -1826,6 +2164,12 @@ const GRID_CSS: &str = "\
 .qtab.plus{padding:0 10px;color:var(--sf-c-accent)}\
 .qx{padding:0 4px;border-radius:8px;opacity:.55}\
 .qx:hover{opacity:1;background:color-mix(in srgb,var(--sf-bad) 30%,transparent)}\
+.side{display:flex;flex-direction:column;height:100%;gap:6px}.side .tree{flex:1 1 auto;min-height:0;height:auto}\
+.envs{flex:0 0 auto;max-height:45%;overflow:auto;box-sizing:border-box;padding:4px;font-family:Geist,system-ui,sans-serif;font-size:12.9px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}.envs.focus{border-color:var(--sf-c-accent)}\
+.eh{display:flex;justify-content:space-between;gap:8px;padding:2px 8px 4px;font-weight:600}\
+.er{display:flex;align-items:center;gap:8px;height:24px;box-sizing:border-box;padding:0 8px;border-radius:4px;cursor:pointer;white-space:nowrap}.er:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}.er.sel{background:color-mix(in srgb,var(--sf-c-muted) 20%,transparent)}.er.cur{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent)}\
+.em{width:12px;flex-shrink:0;text-align:center}.ed{flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis}.s-bad{color:var(--sf-bad)}\
+.ebar{display:flex;flex-wrap:wrap;gap:6px;padding:4px 6px 2px}.bt{padding:1px 8px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:4px;cursor:pointer;color:var(--sf-c-accent)}.bt:hover{background:color-mix(in srgb,var(--sf-c-accent) 18%,transparent)}\
 .tree{height:100%;overflow:auto;box-sizing:border-box;padding:4px;font-family:Geist,system-ui,sans-serif;font-size:12.9px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}\
 .tr{display:flex;align-items:center;gap:6px;height:24px;box-sizing:border-box;padding:0 8px;white-space:nowrap;cursor:pointer;border-radius:4px}\
 .tr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
@@ -1865,37 +2209,48 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let mut app = App::new(db, profile, server, files)?;
 	app.role = role;
 	let title = match role {
-		Role::Explorer => "SQL Explorer",
-		Role::Editor => "SQL Editor",
-		Role::Whole => "SQL Server",
+		Role::Explorer => "SQL Explorer".to_owned(),
+		Role::Editor => format!("SQL Editor · {}", app.profile().to_uppercase()),
+		Role::Whole => format!("SQL Server · {}", app.profile().to_uppercase()),
 	};
 	if role == Role::Explorer {
 		app.in_editor = false;
 	}
-	if role != Role::Explorer && files.is_empty() && let Some(saved) = crate::session::load(&app.profile) {
+	if role != Role::Explorer && files.is_empty() && let Some(saved) = crate::session::load(app.profile()) {
 		app.restore(saved);
 		app.saved_json = serde_json::to_string(&app.snapshot()).unwrap_or_default();
 	}
 	if role == Role::Editor {
-		match remote::listen(&app.profile) {
+		match remote::listen(app.profile()) {
 			Ok(l) => app.remote = Some(l),
 			Err(e) => app.note = format!("no link to the explorer: {e}"),
 		}
 		if start.db.is_some() || start.sql.is_some() {
 			let db = start.db.clone().unwrap_or_default();
-			app.open_remote(remote::Request { profile: app.profile.clone(), db, sql: start.sql.clone().unwrap_or_default(), run: start.run, quiet: start.quiet });
+			app.open_remote(remote::Request { profile: app.profile().to_owned(), db, sql: start.sql.clone().unwrap_or_default(), run: start.run, quiet: start.quiet });
 		}
 	}
-	let sf = session.open(SurfaceOptions::screen().title(title).role("sqlq"))?;
+	let sf = session.open(SurfaceOptions::screen().title(title.as_str()).role("sqlq"))?;
 	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
 	draw(&mut session, sf, &mut app)?;
 	if role == Role::Explorer {
 		app.ed_focused = false;
+		app.load_envs();
+		app.env_at = app.envs.iter().position(|p| p.name == app.profile()).unwrap_or(0);
+		// The environments connected last time in this directory come back, the one just chosen being first.
+		let again: Vec<String> = crate::session::load_envs().into_iter().filter(|n| n != app.profile()).collect();
+		for name in &again {
+			app.env_connect(name);
+		}
+		if !again.is_empty() {
+			app.note = format!("reconnecting {} from last time", again.join(", "));
+		}
+		app.remember_envs();
 		session.focus(sf, None)?;
 		// An explorer alone is half a screen: open an editor beside it.
 		// Focus stays here: the user just opened the explorer.
-		let first = remote::Request { profile: app.profile.clone(), db: app.current.clone(), quiet: true, ..remote::Request::default() };
-		if let Err(e) = remote::open(&app.profile, &first, false) {
+		let first = remote::Request { profile: app.profile().to_owned(), db: app.current().to_owned(), quiet: true, ..remote::Request::default() };
+		if let Err(e) = remote::open(app.profile(), &first, false) {
 			app.note = e;
 		}
 		draw(&mut session, sf, &mut app)?;
@@ -1911,7 +2266,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
-		let idle = app.queue.is_empty() && app.dialog.is_none();
+		let idle = app.conns.iter().all(|c| c.queue.is_empty()) && app.dialog.is_none() && app.connecting.is_empty();
 		let wait = Some(Duration::from_millis(if !idle { 100 } else if app.remote.is_some() { 250 } else { 1500 }));
 		let input = match session.next(wait) {
 			Ok(input) => input,
@@ -1928,6 +2283,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		}
 		let mut changed = app.poll();
 		changed |= app.poll_dialog();
+		changed |= app.poll_connects();
 		let requests: Vec<remote::Request> = app.remote.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
 		if !requests.is_empty() {
 			for r in requests {
@@ -1941,6 +2297,11 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			// Nothing arrived: the pane's height may have changed, and the surface is never told.
 			if idle && rows_checked.elapsed() > Duration::from_millis(1500) && let Some(r) = {
 				rows_checked = Instant::now();
+				if app.role == Role::Explorer {
+					let before = app.envs.len();
+					app.load_envs();
+					changed |= app.envs.len() != before;
+				}
 				pane_rows().filter(|r| *r != app.rows)
 			} {
 				app.rows = r;
@@ -2010,6 +2371,9 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 					if app.paste(&key) {
 						session.focus(sf, Some(app.editor_id().as_str()))?;
 					}
+				} else if key.is("f6") && app.role == Role::Explorer {
+					app.in_envs = !app.in_envs;
+				} else if app.role == Role::Explorer && app.in_envs && app.env_key(&key) {
 				} else if !app.in_editor && !app.grid_focus {
 					app.tree_key(&key);
 				} else if (app.native == 0 || !app.ed_focused) && !app.grid_focus && app.buf().key(&key) {
@@ -2117,7 +2481,20 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::GroupToggle, _) => app.by_schema = !app.by_schema,
-			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
+			Input::Msg(Msg::TreeSel(id), _) => {
+				app.picked = Some(id);
+				app.in_envs = false;
+			},
+			Input::Msg(Msg::EnvSel(name), _) => {
+				if let Some(i) = app.envs.iter().position(|p| p.name == name) {
+					app.env_at = i;
+				}
+				app.in_envs = true;
+			},
+			Input::Msg(Msg::EnvConnect(name), _) => app.env_connect(&name),
+			Input::Msg(Msg::EnvDisconnect(name), _) => app.env_disconnect(&name),
+			Input::Msg(Msg::EnvForm(name), _) => app.env_form(name.as_deref()),
+			Input::Msg(Msg::EnvQuery(name), _) => app.env_query(&name),
 			Input::Msg(Msg::Side(d), _) => app.side = (app.side as i32 + d).clamp(0, SIDES.len() as i32 - 1) as usize,
 			Input::Msg(Msg::DbRow(id, act), _) => {
 				app.picked = Some(id);
@@ -2260,6 +2637,18 @@ mod tests {
 		assert_eq!((b.text.as_str(), b.cursor, b.undo.len()), ("SELECT 1\n-- a\n-- b\n", 19, 1));
 		b.undo();
 		assert_eq!((b.text.as_str(), b.cursor), ("SELECT 1", 8));
+	}
+
+	#[test]
+	fn tree_ids_carry_their_connection() {
+		assert_eq!(split_id(&root_id("prod")), Some(("srv", "prod", "")));
+		assert_eq!(split_id(&db_id("prod", "Titan")), Some(("db:", "prod", "Titan")));
+		assert_eq!(split_id(&format!("p:{}", db_id("qas", "Titan"))), Some(("db:", "qas", "Titan")));
+		let obj = format!("o:qas{SEP}Titan{SEP}dbo{SEP}Orders");
+		assert_eq!(split_id(&obj), Some(("o:", "qas", &format!("Titan{SEP}dbo{SEP}Orders")[..])));
+		assert_eq!(split_id(&format!("g:qas{SEP}Titan:tables{SEP}dbo")).map(|(_, _, t)| t.rsplit_once(':').map(|(db, _)| db)), Some(Some("Titan")));
+		assert_eq!(split_id("srv"), None);
+		assert_eq!(split_id("junk"), None);
 	}
 
 	#[test]

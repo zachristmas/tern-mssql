@@ -48,6 +48,29 @@ pub fn path(profile: &str) -> PathBuf {
 	dir.join(format!("{safe}-{:016x}.json", fnv(&cwd.to_string_lossy().to_lowercase())))
 }
 
+/// The file naming the environments the explorer had connected in the current directory.
+pub fn envs_path() -> PathBuf {
+	let cwd = std::env::current_dir().unwrap_or_default();
+	let dir = crate::profile::path().parent().map(PathBuf::from).unwrap_or_default().join("sessions");
+	dir.join(format!("envs-{:016x}.json", fnv(&cwd.to_string_lossy().to_lowercase())))
+}
+
+/// The environments connected last time in this directory.
+pub fn load_envs() -> Vec<String> {
+	std::fs::read_to_string(envs_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Remembers the connected environments for this directory.
+pub fn store_envs(names: &[String]) -> std::io::Result<()> {
+	let file = envs_path();
+	if let Some(dir) = file.parent() {
+		std::fs::create_dir_all(dir)?;
+	}
+	let tmp = file.with_extension("tmp");
+	std::fs::write(&tmp, serde_json::to_string(names).map_err(std::io::Error::other)?)?;
+	std::fs::rename(&tmp, &file)
+}
+
 /// The saved session, if there is a readable one.
 pub fn load(profile: &str) -> Option<Saved> {
 	let saved: Saved = serde_json::from_str(&std::fs::read_to_string(path(profile)).ok()?).ok()?;

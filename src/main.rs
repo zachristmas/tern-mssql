@@ -1,7 +1,7 @@
 //! `tern-mssql [PROFILE] [FILE.sql...]`: the interactive client (a picker when PROFILE is omitted).
 //! `tern-mssql query PROFILE SQL`: one batch printed as a table.
 //! `tern-mssql explorer PROFILE`, `tern-mssql editor PROFILE [--db DB] [--sql-file F] [--run]`: the two panes of the split layout.
-//! `tern-mssql --new`: the picker, opened on a blank new-connection form.
+//! `tern-mssql --new`: the picker, opened on a blank new-connection form; `--edit NAME` opens it on that connection.
 //! `tern-mssql profiles`: the saved profiles.
 
 mod app;
@@ -125,7 +125,11 @@ fn main() -> anyhow::Result<()> {
 			}
 			Ok(())
 		},
-		[] | ["--new"] => match connect::choose(!args.is_empty())? {
+		[] | ["--new"] => match connect::choose(!args.is_empty(), None)? {
+			Some((db, name, server)) => app::run(db, name, server, &[], app::Role::Explorer, app::Start::default()),
+			None => Ok(()),
+		},
+		["--edit", name] => match connect::choose(false, Some(name))? {
 			Some((db, name, server)) => app::run(db, name, server, &[], app::Role::Explorer, app::Start::default()),
 			None => Ok(()),
 		},

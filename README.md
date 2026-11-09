@@ -30,6 +30,7 @@ Built on [`tern-sdk`](https://crates.io/crates/tern-sdk) for the UI and [`tiberi
 - Open tabs autosave per launch directory and connection, then come back on the next start.
 - Read-only by default: a guard refuses statements that look like writes until you press `F8`.
 - Split layout with the explorer and editor in separate Tern panes linked over loopback.
+- Several environments at once: the explorer keeps an environments box above the tree, so `dev`, `qas` and `prod` can each have their own root, each with its databases, schemas and tables. Pick one and press Enter to connect, `x` to disconnect, `q` for a new query on it; a table opened from an environment goes to that environment's editor pane, and later editor panes stack under the first so the explorer keeps its column. The set of connected environments is remembered per directory and comes back on the next start.
 
 <p align="center"><img src="docs/completion.png" alt="Column completion after a table alias, with each column's type, nullability and key" width="900"></p>
 
@@ -60,6 +61,7 @@ The status line shows `native edit` or `key edit` depending on how the terminal 
 ```text
 tern-mssql [PROFILE] [FILE.sql...]   query window (connection manager if no PROFILE)
 tern-mssql --new                     connection manager on a blank form
+tern-mssql --edit PROFILE            connection manager on that profile's form
 tern-mssql query PROFILE "SQL"       run one batch and print it as a table
 tern-mssql profiles                  list saved profiles
 ```
@@ -112,6 +114,11 @@ For scripts and CI, a profile can name an environment variable to read the passw
 
 | Key | Action |
 |---|---|
+| `F6` | Switch between the environments box and the tree |
+| `Enter` on an environment | Connect, or show its tree when it is connected |
+| `x` on an environment | Disconnect (its editor panes keep their own connection) |
+| `n` / `e` on an environment | New connection / edit it, in a form pane below |
+| `q` on an environment | New empty query in that environment's editor pane |
 | Arrows | Move through the tree (`Left` jumps to the parent) |
 | `Enter` / double-click on a table | Open `SELECT TOP (1000)` in a new tab |
 | Double-click on a database | Make it the editor's database |
